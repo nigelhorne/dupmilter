@@ -1,0 +1,258 @@
+#!/usr/bin/env perl
+
+#  Copyright (C) 2014-2018 Nigel Horne <njh@bandsman.co.uk>.
+
+# Usage is subject to licence terms.
+# The licence terms of this software are as follows:
+# Personal single user, single computer use: GPL2
+# All other users (including Commercial, Charity, Educational, Government)
+#	must apply in writing for a licence for use from Nigel Horne at the
+#	above e-mail.
+
+# Block emails that have previously been reported as spam.
+# Block emails with the same subject that come from more than one person.
+#	TODO: more work to avoid false-positives
+
+# To install, simply put this script into /usr/local/etc/dupmilter
+
+# To run add this to /etc/rc.local:
+#	rm -f /var/tmp/dupmilter
+#	/usr/local/etc/dupmilter local:/var/tmp/dupmilter
+#
+# or put this is in /etc/systemd/system/dupmilter.service:
+#
+# [Unit]
+# Description=Block resent spams
+# After=network.target
+# 
+# [Service]
+# ExecStart=/usr/local/etc/dupmilter local:/var/run/dupmilter
+# KillMode=process
+# Restart=on-failure
+# 
+# [Install]
+# WantedBy=multi-user.target
+#
+# INPUT_MAIL_FILTER(`dupmilter', `S=local:/var/tmp/dupmilter, F=T, T=S:4m;R:4m')dnl
+
+# Version 1.0 12/4/13:
+#	First version
+# Version 1.1 26/4/16:
+#	Don't scan local connections
+
+use strict;
+# use diagnostics;
+use warnings;
+use Sendmail::PMilter qw(:all);
+# use CHI::Driver::Memcached;
+# use CHI::Driver::Redis;
+use CHI;
+use Digest::MD5;
+use Net::DNS;
+use Data::Validate::IP;
+
+my $milter = Sendmail::PMilter->new();
+my $resolver = Net::DNS::Resolver->new();
+
+my %whitelist_hosts = (
+        'oracle1.bandsman.co.uk' => 1,
+        'oracle2.bandsman.co.uk' => 1,
+	'bandsman.mooo.com' => 1
+);
+
+# my $cache = CHI->new(
+	# driver => 'Memcached',
+	# namespace => 'dupmilter',
+	# 'servers' => [ '127.0.0.1:11211', '192.168.1.16:11211', '192.168.1.15:11211', '192.168.1.2:11211' ],
+	# 'debug' => 0,
+	# 'compress_threshold' => 10_000
+# );
+my $cache = CHI->new(
+	driver => 'File',
+	namespace => 'dupmilter',
+	root_dir => '/tmp/cache',
+);
+# my $cache = CHI->new(
+	# driver => 'Redis',
+	# namespace => 'dupmilter',
+	# server => 'dupmilter.0m8lua.0001.use1.cache.amazonaws.com'
+# );
+
+my %cbs;
+$cbs{'connect'} = sub {
+	my ($ctx, $hostname) = @_;
+
+	my $ip;
+
+	if($hostname =~ /\[(.+)]/) {
+		$ip = $1;
+		unless(is_ipv4($ip)) {
+			warn("$ip isn't a valid IPv4 address");
+			$ctx->setreply(554, "5.7.1", "$ip isn't a valid IPv4 address");
+			return SMFIS_REJECT;
+		}
+		if($ip =~ /^192\.168\./) {
+			return SMFIS_ACCEPT;
+		}
+	} elsif($hostname eq 'localhost') {
+		return SMFIS_ACCEPT;
+	} elsif(exists($whitelist_hosts{$hostname})) {
+		return SMFIS_ACCEPT;
+	} else {
+		if(my $query = $resolver->search($hostname)) {
+			foreach my $rr ($query->answer()) {
+				next unless($rr->type() eq 'A');
+				$ip = $rr->address();
+				last;
+			}
+		} else {
+			warn("Can't resolve hostname $hostname, ", $resolver->errorstring());
+			$ctx->setreply(554, "5.7.1", "Can't resolve hostname $hostname");
+			return SMFIS_REJECT;
+		}
+
+		unless($ip) {
+			warn("hostname $hostname, has no A record - rejecting");
+			$ctx->setreply(554, "5.7.1", "hostname $hostname, has no A record - rejecting");
+			return SMFIS_REJECT;
+		}
+
+		# print "Dupmilter: connection from $hostname, resolved to $ip\n";
+	}
+
+	if(is_private_ipv4($ip) || is_loopback_ipv4($ip)) {
+		return SMFIS_ACCEPT;
+	}
+
+	$ctx->setpriv({});	# Put empty hash into private area
+
+	return SMFIS_CONTINUE;
+};
+$cbs{'header'} = sub {
+	my ($ctx, @args) = @_;
+
+	my $hash = $ctx->getpriv();
+
+	for(my $ctr = 0; $ctr <= $#args; $ctr++) {
+		my $line = $args[$ctr++];
+		$line .= ': ' . $args[$ctr] . "\n";
+		if($line =~ m/From\: /g) {
+			my($header, $value) = split /\: /, $line, 2;
+			my($username, $domain) = split /\@/, $value, 2;
+			$username =~ s/\<//g;
+			$username =~ s/\n//g;
+			$username = lc($username);
+			$hash->{'from'} = $username;
+			# print 'dupmilter: from: ', $hash->{'from'}, "\n";
+			my $subject = $hash->{'subject'};
+			if($subject && ($subject !~ /^Re: /) && (my $entry = $cache->get($subject))) {
+				# Same e-mail sent from two people
+				if($entry ne $username) {
+					print "dupmilter: spam $subject from $username previously sent by $entry\n";
+					$ctx->setreply(554, '5.7.1', 'Rejecting your spam');
+					return SMFIS_REJECT;
+				} else {
+					# print "dupmilter: $subject from $username sent more than once\n";
+				}
+			}
+		} elsif($line =~ m/Subject\: /g) {
+			my($header, $value) = split /\: /, $line, 2;
+			$value = lc($value);
+			$value =~ s/\n//g;
+			$hash->{'subject'} = $value;
+			# print 'dupmilter: subject: ', $hash->{'subject'}, "\n";
+			my $from = $hash->{'from'};
+			if($from && ($value !~ /^Re: /) && (my $entry = $cache->get($value))) {
+				# Same e-mail sent from two people
+				if($entry ne $from) {
+					print "dupmilter: spam $value from $from previously sent by $entry\n";
+					$ctx->setreply(554, '5.7.1', 'Rejecting your spam');
+					return SMFIS_REJECT;
+				} else {
+					# print "dupmilter: $value from $from sent more than once\n";
+				}
+			}
+		}
+		# push @header, $line;
+	}
+
+	SMFIS_CONTINUE;
+};
+$cbs{'eoh'} = sub {
+	my $ctx = shift;
+
+	my $hash = $ctx->getpriv();
+	my $subject = $hash->{'subject'};
+	my $from = $hash->{'from'};
+
+	if($subject && ($subject !~ /^Re: /) && $from) {
+		# print "dupmilter: lookup $subject\n";
+		if(my $prev = $cache->get($subject)) {
+			if($prev ne $from) {
+				print "dupmilter: $subject has come from both $prev and $from\n";
+				$ctx->setreply(554, '5.7.1', 'Rejecting your spam');
+				return SMFIS_REJECT;
+			} else {
+				# print "dupmilter: $subject has come more than once from $from\n";
+			}
+		} else {
+			# print "dupmilter: set $subject to $from\n";
+			$cache->set($subject, $from, '1 hour');
+		}
+	}
+	$ctx->setpriv({});	# Recover memory
+
+	return SMFIS_CONTINUE;
+};
+$cbs{'body'} = sub {
+	my ($ctx, $body) = @_;
+
+	my $hash = $ctx->getpriv();
+
+	$hash->{'body'} .= $body;
+
+	$ctx->setpriv($hash);
+
+	return SMFIS_CONTINUE;
+};
+$cbs{'eom'} = sub {
+	my $ctx = shift;
+
+	my $hash = $ctx->getpriv();
+
+	my $body = $hash->{'body'};
+
+	unless(defined($body)) {
+		return SMFIS_CONTINUE;
+	}
+
+	$body =~ s/\r//g;
+
+	if(length($body) > (1024 * 1024)) {
+		# print "Ignoring large e-mail\n";
+		$ctx->setpriv(undef);
+		return SMFIS_ACCEPT;
+	}
+
+	my $digest = Digest::MD5::md5_hex($body);
+
+	if($cache->get($digest)) {
+		print "dupmilter found spam signature $digest\n";
+		$ctx->setreply(554, '5.7.1', 'Rejecting your spam');
+		return SMFIS_REJECT;
+	}
+	$ctx->setpriv(undef);
+	# print "Not a match\n";
+	return SMFIS_ACCEPT;
+};
+$cbs{'close'} = $cbs{'abort'} = sub {
+	my $ctx = shift;
+	$ctx->setpriv(undef);
+
+	# print "abort\n";
+	return SMFIS_CONTINUE;
+};
+
+$milter->auto_setconn('dupmilter');
+$milter->register('dupmilter', \%cbs, SMFI_CURR_ACTS);
+$milter->main();
