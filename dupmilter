@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 
-#  Copyright (C) 2014-2018 Nigel Horne <njh@bandsman.co.uk>.
+#  Copyright (C) 2014-2023 Nigel Horne <njh@bandsman.co.uk>.
 
 # Usage is subject to licence terms.
 # The licence terms of this software are as follows:
@@ -9,7 +9,9 @@
 #	must apply in writing for a licence for use from Nigel Horne at the
 #	above e-mail.
 
-# Block emails that have previously been reported as spam.
+# Block emails that have previously been reported as spam
+#	They will have been put into the "dupmilter" cache by a spam-reporting script
+
 # Block emails with the same subject that come from more than one person.
 #	TODO: more work to avoid false-positives
 
