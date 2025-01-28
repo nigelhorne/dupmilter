@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 
-#  Copyright (C) 2014-2023 Nigel Horne <njh@bandsman.co.uk>.
+#  Copyright (C) 2014-2025 Nigel Horne <njh@bandsman.co.uk>.
 
 # Usage is subject to licence terms.
 # The licence terms of this software are as follows:
@@ -52,6 +52,7 @@ use CHI;
 use Digest::MD5;
 use Net::DNS;
 use Data::Validate::IP;
+use Sys::Syslog qw(:standard :macros);
 
 my $milter = Sendmail::PMilter->new();
 my $resolver = Net::DNS::Resolver->new();
@@ -192,6 +193,7 @@ $cbs{'eoh'} = sub {
 		if(my $prev = $cache->get($subject)) {
 			if($prev ne $from) {
 				print "dupmilter: $subject has come from both $prev and $from\n";
+				syslog(LOG_WARNING, 'Message rejected: spam detected');
 				$ctx->setreply(554, '5.7.1', 'Rejecting your spam');
 				return SMFIS_REJECT;
 			} else {
@@ -241,6 +243,7 @@ $cbs{'eom'} = sub {
 	if($cache->get($digest)) {
 		print "dupmilter found spam signature $digest\n";
 		$ctx->setreply(554, '5.7.1', 'Rejecting your spam');
+		syslog(LOG_WARNING, 'Message rejected: spam detected');
 		return SMFIS_REJECT;
 	}
 	$ctx->setpriv(undef);
