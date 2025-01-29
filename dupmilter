@@ -54,6 +54,10 @@ use Net::DNS;
 use Data::Validate::IP;
 use Sys::Syslog qw(:standard :macros);
 
+my $name = 'dupmilter';
+
+openlog $name, 'cons,pid', LOG_MAIL;
+
 my $milter = Sendmail::PMilter->new();
 my $resolver = Net::DNS::Resolver->new();
 
@@ -72,12 +76,12 @@ my %whitelist_hosts = (
 # );
 my $cache = CHI->new(
 	driver => 'File',
-	namespace => 'dupmilter',
+	namespace => $name,
 	root_dir => '/tmp/cache',
 );
 # my $cache = CHI->new(
 	# driver => 'Redis',
-	# namespace => 'dupmilter',
+	# namespace => $name,
 	# server => 'dupmilter.0m8lua.0001.use1.cache.amazonaws.com'
 # );
 
@@ -146,16 +150,16 @@ $cbs{'header'} = sub {
 			$username =~ s/\n//g;
 			$username = lc($username);
 			$hash->{'from'} = $username;
-			# print 'dupmilter: from: ', $hash->{'from'}, "\n";
+			# print "$name: from: ", $hash->{'from'}, "\n";
 			my $subject = $hash->{'subject'};
 			if($subject && ($subject !~ /^Re: /) && (my $entry = $cache->get($subject))) {
 				# Same e-mail sent from two people
 				if($entry ne $username) {
-					print "dupmilter: spam $subject from $username previously sent by $entry\n";
+					print "$name: spam $subject from $username previously sent by $entry\n";
 					$ctx->setreply(554, '5.7.1', 'Rejecting your spam');
 					return SMFIS_REJECT;
 				} else {
-					# print "dupmilter: $subject from $username sent more than once\n";
+					# print "$name: $subject from $username sent more than once\n";
 				}
 			}
 		} elsif($line =~ m/Subject\: /g) {
@@ -163,16 +167,16 @@ $cbs{'header'} = sub {
 			$value = lc($value);
 			$value =~ s/\n//g;
 			$hash->{'subject'} = $value;
-			# print 'dupmilter: subject: ', $hash->{'subject'}, "\n";
+			# print "$name: subject: ", $hash->{'subject'}, "\n";
 			my $from = $hash->{'from'};
 			if($from && ($value !~ /^Re: /) && (my $entry = $cache->get($value))) {
 				# Same e-mail sent from two people
 				if($entry ne $from) {
-					print "dupmilter: spam $value from $from previously sent by $entry\n";
+					print "$name: spam $value from $from previously sent by $entry\n";
 					$ctx->setreply(554, '5.7.1', 'Rejecting your spam');
 					return SMFIS_REJECT;
 				} else {
-					# print "dupmilter: $value from $from sent more than once\n";
+					# print "$name: $value from $from sent more than once\n";
 				}
 			}
 		}
@@ -189,18 +193,18 @@ $cbs{'eoh'} = sub {
 	my $from = $hash->{'from'};
 
 	if($subject && ($subject !~ /^Re: /) && $from) {
-		# print "dupmilter: lookup $subject\n";
+		# print "$name: lookup $subject\n";
 		if(my $prev = $cache->get($subject)) {
 			if($prev ne $from) {
-				print "dupmilter: $subject has come from both $prev and $from\n";
+				print "$name: $subject has come from both $prev and $from\n";
 				syslog(LOG_WARNING, 'Message rejected: spam detected');
 				$ctx->setreply(554, '5.7.1', 'Rejecting your spam');
 				return SMFIS_REJECT;
 			} else {
-				# print "dupmilter: $subject has come more than once from $from\n";
+				# print "$name: $subject has come more than once from $from\n";
 			}
 		} else {
-			# print "dupmilter: set $subject to $from\n";
+			# print "$name: set $subject to $from\n";
 			$cache->set($subject, $from, '1 hour');
 		}
 	}
@@ -241,7 +245,7 @@ $cbs{'eom'} = sub {
 	my $digest = Digest::MD5::md5_hex($body);
 
 	if($cache->get($digest)) {
-		print "dupmilter found spam signature $digest\n";
+		print "$name found spam signature $digest\n";
 		$ctx->setreply(554, '5.7.1', 'Rejecting your spam');
 		syslog(LOG_WARNING, 'Message rejected: spam detected');
 		return SMFIS_REJECT;
@@ -258,6 +262,6 @@ $cbs{'close'} = $cbs{'abort'} = sub {
 	return SMFIS_CONTINUE;
 };
 
-$milter->auto_setconn('dupmilter');
-$milter->register('dupmilter', \%cbs, SMFI_CURR_ACTS);
+$milter->auto_setconn($name);
+$milter->register($name, \%cbs, SMFI_CURR_ACTS);
 $milter->main();
